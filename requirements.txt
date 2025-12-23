@@ -1,0 +1,13 @@
+streamlit
+torch
+torchvision
+ftfy
+regex
+tqdm
+git+https://github.com/openai/CLIP.git
+transformers
+pillow
+requests
+accelerate
+deep-translator
+numpy
