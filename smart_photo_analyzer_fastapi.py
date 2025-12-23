@@ -1,81 +1,67 @@
-# smart_photo_analyzer_fastapi.py
+# app.py
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional, Union
-import torch
-import clip
+import streamlit as st
 from PIL import Image
 import requests
 from io import BytesIO
+import torch
+import clip
 from transformers import BlipProcessor, BlipForConditionalGeneration
 import numpy as np
 from deep_translator import GoogleTranslator
 import warnings
-import uvicorn
-
 warnings.filterwarnings('ignore')
 
-# ---------------------
-# Инициализация моделей
-# ---------------------
+st.set_page_config(page_title="Умный Фото-Анализатор", layout="wide")
+st.title("🖼️ Умный Фото-Анализатор")
+st.markdown("Анализ изображений с помощью CLIP и BLIP")
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# ==============
+# Инициализация
+# ==============
 
-# CLIP
-clip_model, preprocess = clip.load("ViT-B/32", device=device)
-clip_model.eval()
+@st.cache_resource
+def load_models():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    st.write(f"Используется устройство: `{device}`")
+    
+    # CLIP
+    clip_model, preprocess = clip.load("ViT-B/32", device=device)
+    clip_model.eval()
+    
+    # BLIP
+    blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+    blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
+    blip_model.eval()
+    
+    translator = GoogleTranslator(source='en', target='ru')
+    
+    return clip_model, preprocess, blip_processor, blip_model, translator, device
 
-# BLIP
-blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
-blip_model.eval()
+clip_model, preprocess, blip_processor, blip_model, translator, device = load_models()
 
-# Переводчик
-translator = GoogleTranslator(source='en', target='ru')
+def load_image(image_source):
+    if isinstance(image_source, str):  # URL
+        response = requests.get(image_source, timeout=10)
+        image = Image.open(BytesIO(response.content)).convert('RGB')
+    else:  # UploadedFile
+        image = Image.open(image_source).convert('RGB')
+    return image
 
-# ---------------------
-# Вспомогательные функции
-# ---------------------
-
-def load_image_from_url(url: str) -> Image.Image:
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        img = Image.open(BytesIO(response.content)).convert('RGB')
-        return img
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Ошибка загрузки изображения по URL: {str(e)}")
-
-def load_image_from_bytes(data: bytes) -> Image.Image:
-    try:
-        img = Image.open(BytesIO(data)).convert('RGB')
-        return img
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Ошибка загрузки изображения из файла: {str(e)}")
-
-def analyze_image_with_clip(image: Image.Image, categories: List[str]) -> List[dict]:
+def analyze_with_clip(image, categories):
     image_input = preprocess(image).unsqueeze(0).to(device)
     text_inputs = torch.cat([clip.tokenize(f"a photo of {c}") for c in categories]).to(device)
 
     with torch.no_grad():
         image_features = clip_model.encode_image(image_input)
         text_features = clip_model.encode_text(text_inputs)
-
         image_features /= image_features.norm(dim=-1, keepdim=True)
         text_features /= text_features.norm(dim=-1, keepdim=True)
-
         similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
-
     probs = similarity[0].cpu().numpy()
-    results = [
-        {"category": categories[i], "probability": float(probs[i])}
-        for i in np.argsort(probs)[::-1]
-    ]
-    return results
+    return probs
 
-def generate_caption_blip(image: Image.Image) -> dict:
+def generate_caption(image):
     inputs = blip_processor(image, return_tensors="pt").to(device)
     with torch.no_grad():
         output = blip_model.generate(**inputs, max_length=70)
@@ -84,76 +70,74 @@ def generate_caption_blip(image: Image.Image) -> dict:
         caption_ru = translator.translate(caption_en)
     except:
         caption_ru = caption_en
-    return {"caption_en": caption_en, "caption_ru": caption_ru}
+    return caption_en, caption_ru
 
-# ---------------------
-# FastAPI приложение
-# ---------------------
+# ==============
+# Интерфейс
+# ==============
 
-app = FastAPI(title="Умный Фото-Анализатор", version="1.0")
+input_type = st.radio("Выберите способ загрузки изображения", ("URL", "Файл"))
 
-# Разрешить CORS (для Streamlit или фронтенда)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+image = None
 
-class AnalysisRequest(BaseModel):
-    image_url: Optional[str] = None
-    categories: Optional[List[str]] = None
+if input_type == "URL":
+    url = st.text_input("Введите URL изображения", "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba")
+    if url:
+        try:
+            image = load_image(url)
+        except Exception as e:
+            st.error(f"Ошибка загрузки: {e}")
+else:
+    uploaded_file = st.file_uploader("Загрузите изображение", type=["png", "jpg", "jpeg"])
+    if uploaded_file:
+        try:
+            image = load_image(uploaded_file)
+        except Exception as e:
+            st.error(f"Ошибка загрузки: {e}")
 
-@app.post("/analyze_url")
-async def analyze_from_url(request: AnalysisRequest):
-    if not request.image_url:
-        raise HTTPException(status_code=400, detail="Поле image_url обязательно.")
+if image:
+    st.image(image, caption="Загруженное изображение", width=400)
 
-    image = load_image_from_url(request.image_url)
-
-    categories = request.categories or [
+    # Категории
+    default_cats = [
         "a cat", "a dog", "a person", "a car", "a nature landscape",
         "a city skyline", "food", "an interior design", "an animal",
         "technology device", "a sunset", "a beach", "mountains",
         "a forest", "a building", "art", "flowers"
     ]
+    
+    custom = st.checkbox("Использовать свои категории")
+    if custom:
+        cats_input = st.text_area("Введите категории через запятую", "modern architecture, historical building, nature scene")
+        categories = [c.strip() for c in cats_input.split(",") if c.strip()]
+    else:
+        categories = default_cats
 
-    clip_results = analyze_image_with_clip(image, categories)
-    caption = generate_caption_blip(image)
+    if st.button("Анализировать"):
+        with st.spinner("Анализ изображения..."):
+            # CLIP
+            probs = analyze_with_clip(image, categories)
+            sorted_idx = np.argsort(probs)[::-1]
 
-    return {
-        "top_category": clip_results[0]["category"],
-        "confidence": clip_results[0]["probability"] * 100,
-        "clip_results": clip_results,
-        "caption": caption
-    }
+            # Таблица результатов
+            st.subheader("Результаты CLIP")
+            results_data = []
+            for i in range(min(5, len(categories))):
+                idx = sorted_idx[i]
+                results_data.append({
+                    "Категория": categories[idx],
+                    "Вероятность (%)": f"{probs[idx]*100:.2f}"
+                })
+            st.table(results_data)
 
-@app.post("/analyze_file")
-async def analyze_from_file(
-    file: UploadFile = File(...),
-    categories: Optional[str] = None  # передавать как строку, разделённую запятыми
-):
-    contents = await file.read()
-    image = load_image_from_bytes(contents)
+            top_cat = categories[sorted_idx[0]]
+            top_conf = probs[sorted_idx[0]] * 100
 
-    cat_list = [c.strip() for c in categories.split(",")] if categories else [
-        "a cat", "a dog", "a person", "a car", "a nature landscape",
-        "a city skyline", "food", "an interior design", "an animal",
-        "technology device", "a sunset", "a beach", "mountains",
-        "a forest", "a building", "art", "flowers"
-    ]
+            # BLIP
+            caption_en, caption_ru = generate_caption(image)
 
-    clip_results = analyze_image_with_clip(image, cat_list)
-    caption = generate_caption_blip(image)
+            st.subheader("Описание от BLIP")
+            st.write(f"**EN:** {caption_en}")
+            st.write(f"**RU:** {caption_ru}")
 
-    return {
-        "top_category": clip_results[0]["category"],
-        "confidence": clip_results[0]["probability"] * 100,
-        "clip_results": clip_results,
-        "caption": caption
-    }
-
-@app.get("/")
-def root():
-    return {"message": "Умный Фото-Анализатор API работает! Используйте /analyze_url или /analyze_file"}
+            st.success(f"Лучшая категория: **{top_cat}** (уверенность: {top_conf:.2f}%)")
